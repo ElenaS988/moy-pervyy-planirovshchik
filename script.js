@@ -13,6 +13,7 @@
   let filters = {}, modal = null, lastActivity = Date.now(), channel, toastTimer;
   const passwordProofs = new Map();
   let planningTab='plans', planningMonth='', planningKind='all', forecastDate='', reconciling=false;
+  let reportPeriod='month', reportAnchor='', reportGoal='', voiceRecognition=null, voiceTimer=null;
   const id = () => crypto.randomUUID(), now = () => new Date().toISOString();
   const clone = x => structuredClone(x);
   const el = (tag, attrs = {}, ...children) => {
@@ -102,6 +103,78 @@
     }
     return {income,expense,bankFees,otherFees,missing};
   }
+
+  /* Reports use posted revisions and their historical RUB snapshots. Plans never enter facts. */
+  const utcDate = value => new Date(value+'T12:00:00Z');
+  const isoDate = value => value.toISOString().slice(0,10);
+  const monthStart = value => value.slice(0,7)+'-01';
+  const weekday = value => new Intl.DateTimeFormat('ru-RU',{weekday:'short',timeZone:'UTC'}).format(utcDate(value)).replace('.','');
+  function reportRange(kind,anchor=today(data)) {
+    const safe=validDate(anchor)?anchor:today(data);let start,end,label;
+    if(kind==='day'){start=end=safe;label=formatDate(safe);}
+    else if(kind==='week'){const shift=(utcDate(safe).getUTCDay()+6)%7;start=addDays(safe,-shift);end=addDays(start,6);label=`${formatDate(start)} — ${formatDate(end)}`;}
+    else if(kind==='year'){start=safe.slice(0,4)+'-01-01';end=safe.slice(0,4)+'-12-31';label=safe.slice(0,4)+' год';}
+    else {kind='month';start=monthStart(safe);end=monthEnd(start);label=new Intl.DateTimeFormat('ru-RU',{month:'long',year:'numeric',timeZone:'UTC'}).format(utcDate(start));}
+    return {kind,start,end,label,anchor:safe};
+  }
+  function shiftRange(range,direction) {
+    if(range.kind==='day')return addDays(range.anchor,direction);
+    if(range.kind==='week')return addDays(range.anchor,direction*7);
+    if(range.kind==='year')return `${Number(range.anchor.slice(0,4))+direction}-${range.anchor.slice(5)}`;
+    return isoDate(new Date(Date.UTC(Number(range.anchor.slice(0,4)),Number(range.anchor.slice(5,7))-1+direction,1,12)));
+  }
+  function reportBins(range) {
+    if(range.kind==='day')return Array.from({length:24},(_,hour)=>({key:String(hour).padStart(2,'0'),label:String(hour).padStart(2,'0')+':00',date:range.start}));
+    if(range.kind==='week'){const out=[];for(let i=0;i<7;i++){const date=addDays(range.start,i);out.push({key:date,label:weekday(date),date});}return out;}
+    if(range.kind==='year')return Array.from({length:12},(_,month)=>{const date=`${range.start.slice(0,4)}-${String(month+1).padStart(2,'0')}-01`;return {key:date.slice(0,7),label:new Intl.DateTimeFormat('ru-RU',{month:'short',timeZone:'UTC'}).format(utcDate(date)).replace('.',''),date:monthEnd(date)};});
+    const out=[];for(let date=range.start;date<=range.end;date=addDays(date,1))out.push({key:date,label:String(Number(date.slice(8))),date});return out;
+  }
+  function reportKey(range,o){return range.kind==='day'?String(Number((o.effectiveTime||'12:00').slice(0,2))).padStart(2,'0'):range.kind==='year'?o.effectiveDate.slice(0,7):o.effectiveDate;}
+  function assetValueAt(s,date) {
+    let value=0n,missing=false;const sums=balances(s,date);
+    for(const w of s.wallets){const amount=sums[w.id]||0n;if(!amount)continue;const rub=inRub(s,amount,w.currency,date);if(rub===null)missing=true;else value+=rub;}
+    for(const d of s.deposits){const amount=depositBalance(s,d,date);if(!amount)continue;const rub=inRub(s,amount,d.currency,date);if(rub===null)missing=true;else value+=rub;}
+    return {value,missing};
+  }
+  function rubAtOperation(s,o,amount=BigInt(o.amount)) {
+    const posting=s.postings.find(p=>p.operationId===o.id&&p.accountType==='wallet'&&p.accountId===o.walletId);
+    return inRub(s,amount,o.currency,o.effectiveDate,posting?.rateSnapshot);
+  }
+  function reportData(s,range) {
+    const bins=reportBins(range).map(row=>({...row,income:0n,expense:0n})),binMap=new Map(bins.map(row=>[row.key,row]));
+    const categoryMap=new Map();let income=0n,expense=0n,other=0n,missing=false;
+    const linesByOperation=new Map();for(const line of s.expenseLines){const lines=linesByOperation.get(line.operationId)||[];lines.push(line);linesByOperation.set(line.operationId,lines);}
+    const ops=active(s).filter(o=>o.effectiveDate>=range.start&&o.effectiveDate<=range.end);
+    for(const o of ops){const bin=binMap.get(reportKey(range,o));
+      const addIncome=(value)=>{if(value===null){missing=true;return;}income+=BigInt(value);if(bin)bin.income+=BigInt(value);};
+      const addExpense=(value)=>{if(value===null){missing=true;return;}expense+=BigInt(value);if(bin)bin.expense+=BigInt(value);};
+      if(o.businessType==='income')addIncome(o.rubSnapshot);
+      for(const part of o.incomeComponents||[])addIncome(part.rubSnapshot);
+      for(const line of linesByOperation.get(o.id)||[]){
+        addExpense(line.rubSnapshot);if(line.rubSnapshot===null){missing=true;continue;}const row=categoryMap.get(line.categoryId)||{id:line.categoryId,name:categoryName(line.categoryId),color:get(s,'categories',line.categoryId)?.color||PALETTE[0],amount:0n};row.amount+=BigInt(line.rubSnapshot);categoryMap.set(line.categoryId,row);
+      }
+      let external=0n;
+      if(o.businessType==='credit_received'||o.businessType==='debt_receive')external=rubAtOperation(s,o)??0n;
+      else if(o.businessType==='debt_issue'){const v=rubAtOperation(s,o);external=v===null?0n:-v;}
+      else if(o.businessType==='debt_return'){
+        const event=s.debtEvents.find(x=>x.operationId===o.id),v=event?rubAtOperation(s,o,BigInt(event.principal)):null;
+        if(v===null&&event)missing=true;else external=o.cashDirection===1?(v||0n):-(v||0n);
+      }
+      other+=external;
+    }
+    const opening=assetValueAt(s,addDays(range.start,-1)),closing=assetValueAt(s,range.end);missing||=opening.missing||closing.missing;
+    const revaluation=closing.value-opening.value-income+expense-other;
+    const categories=[...categoryMap.values()].sort((a,b)=>a.name.localeCompare(b.name,'ru'));
+    return {range,bins,categories,income,expense,other,opening:opening.value,closing:closing.value,revaluation,missing,refundsOver:categories.filter(x=>x.amount<0n).reduce((sum,x)=>sum-x.amount,0n)};
+  }
+  function goalPlanAt(g,date) {
+    if(date<g.firstDate)return 0n;const target=BigInt(g.target);
+    if(g.mode==='date'&&g.dueDate){const all=Math.max(1,dayNumber(g.dueDate)-dayNumber(g.firstDate));const done=Math.max(0,Math.min(all,dayNumber(date)-dayNumber(g.firstDate)));return rounded(target*BigInt(done),BigInt(all));}
+    const index=Math.max(0,(Number(date.slice(0,4))-Number(g.firstDate.slice(0,4)))*12+Number(date.slice(5,7))-Number(g.firstDate.slice(5,7))+1);
+    let monthly=BigInt(g.contributionAmount||0);if(g.contributionType==='percent'){const expected=BigInt(family(data).expectedMonthlyIncome||0);monthly=rounded(expected*parseMoney(g.contributionPercent||'0',4,true),100n*p10(4));monthly=convert(data,monthly,'RUB',g.currency,date)||0n;}
+    const planned=monthly*BigInt(index);return planned>target?target:planned;
+  }
+  function goalReportSeries(g,range) {return reportBins(range).map(bin=>({label:bin.label,date:bin.date,saved:goalInfo(data,g,bin.date).saved,planned:goalPlanAt(g,bin.date)}));}
 
   /* Planning and goals: integer amounts, calendar dates, no writes from calculations. */
   const monthEnd = date => {const [y,m]=date.split('-').map(Number);return new Date(Date.UTC(y,m,0,12)).toISOString().slice(0,10);};
@@ -617,6 +690,10 @@
     }
     if(type==='profile.theme'){u.preferences={...u.preferences,theme:p.theme==='dark'?'dark':'light'};return;}
     needOwner(u);
+    if(type==='family.investments'){
+      const allowed=new Set(['stocks','bonds','funds']),selected=[...new Set(Array.isArray(p.interests)?p.interests:[])].filter(value=>allowed.has(value));
+      f.investmentInterests=selected;audit(s,u.id,type,f.id,'Интересующие инвестиции обновлены',{changedFields:{investmentInterests:{after:selected}}});return;
+    }
     if(type==='family.save'){
       const name=checkText(p.name,1,80,'Название семьи','name');requireThat(validDate(p.startDate),'Выберите дату начала.','startDate');try{new Intl.DateTimeFormat('ru',{timeZone:p.timezone});}catch{throw new AppError('Неизвестный часовой пояс.','timezone');}
       requireThat(!s.operations.length||(p.startDate===f.startDate&&p.timezone===f.timezone),'После первой операции дата и часовой пояс неизменны.');
@@ -671,11 +748,11 @@
     try{await navigator.storage?.persist?.();}catch{/* Persistence refusal does not affect correctness. */}
   }
   function broadcast(){if(channel)channel.postMessage('changed');else try{localStorage.setItem('moneyByPlan:changed',id());}catch{/* Signals are optional. */}}
-  async function refresh(){data=await readAll();if(session){const current=get(data,'users',session.id);if(!current||current.status!=='active'||current.authVersion!==session.authVersion){session=null;closeDialog(true);toast('Профиль заблокирован или пароль изменен. Войдите заново.',true);}}render();}
+  async function refresh(){data=await readAll();if(session){const current=get(data,'users',session.id);if(!current||current.status!=='active'||current.authVersion!==session.authVersion){stopVoiceRecognition();session=null;closeDialog(true);toast('Профиль заблокирован или пароль изменен. Войдите заново.',true);}}render();}
   function applyTheme(theme){document.documentElement.dataset.theme=theme;try{localStorage.setItem('moneyByPlan:theme',theme);}catch{/* Preference only. */}}
   async function toggleTheme(){const theme=document.documentElement.dataset.theme==='dark'?'light':'dark';applyTheme(theme);if(session)try{await command('profile.theme',{theme});}catch(e){toast(e.message,true);}}
   function toast(message,error=false){const node=document.getElementById('toast');node.textContent=message;node.className='toast'+(error?' error':'');node.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>node.hidden=true,6500);}
-  function lock(){if(!session)return;session=null;passwordProofs.clear();closeDialog(true);render();}
+  function lock(){if(!session)return;stopVoiceRecognition();session=null;passwordProofs.clear();closeDialog(true);render();}
   function fatal(message){document.getElementById('app').replaceChildren(el('div',{class:'boot'},el('h1',{},'Не удалось открыть бюджет'),el('span',{},message),el('p',{class:'hint'},'Открывайте страницу через localhost или HTTPS. Данные не удалялись.'),button('Попробовать снова',()=>location.reload(),'primary')));}
 
   /* UI is defined below. All writes go through command(), never from render functions. */
@@ -759,9 +836,67 @@
   }
   const formatDate = date => validDate(date)?new Intl.DateTimeFormat('ru-RU',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'}).format(new Date(date+'T12:00:00Z')):date;
   function totalText(t){return [t.missing.length?el('span',{class:'balance-note'},'Известная часть'):null,el('span',{class:'money'},money(t.known))];}
+  const absBig = value => value<0n?-value:value;
+  const percentBig = (value,max) => max>0n?Math.min(100,Number(rounded(absBig(value)*10000n,max))/100):0;
+  function reportControls(range) {
+    const select=el('select',{'aria-label':'Период отчета','data-testid':'report-period'},[['day','День'],['week','Неделя'],['month','Месяц'],['year','Год']].map(([value,label])=>el('option',{value},label)));select.value=range.kind;
+    select.addEventListener('change',event=>{reportPeriod=event.target.value;reportAnchor=today(data);render();});
+    return el('section',{class:'card report-controls'},el('div',{class:'report-period-actions'},button('←',()=>{reportAnchor=shiftRange(range,-1);render();},'icon quiet',{'aria-label':'Предыдущий период'}),select,button('→',()=>{reportAnchor=shiftRange(range,1);render();},'icon quiet',{'aria-label':'Следующий период'}),button('Текущий период',()=>{reportAnchor=today(data);render();},'small')),el('div',{class:'report-range'},el('span',{class:'eyebrow'},'Фактический отчет'),el('strong',{},range.label),el('span',{class:'hint'},`${formatDate(range.start)} — ${formatDate(range.end)}`)));
+  }
+  function reportTable(columns,rows,label) {
+    return el('details',{class:'chart-table'},el('summary',{},'Таблица значений'),el('div',{class:'table-wrap'},el('table',{'aria-label':label},el('thead',{},el('tr',{},columns.map(text=>el('th',{scope:'col'},text)))),el('tbody',{},rows.map(row=>el('tr',{},row.map(value=>el('td',{},value))))))));
+  }
+  function categoryChart(report) {
+    const positive=report.categories.filter(row=>row.amount>0n),sum=positive.reduce((total,row)=>total+row.amount,0n);
+    const card=el('section',{class:'card chart-card'},el('div',{class:'section-head'},el('div',{},el('h2',{},'Расходы по категориям'),el('p',{class:'hint'},'Чистые расходы за выбранный период. Комиссии входят как обычные расходы.'))));
+    if(!positive.length){card.append(empty('Расходов пока нет','Добавьте расход — здесь появится распределение по категориям.'));return card;}
+    let at=0;const parts=[];for(const row of positive){const share=percentBig(row.amount,sum);parts.push(`${row.color} ${at}% ${Math.min(100,at+share)}%`);at+=share;}
+    const ring=el('div',{class:'donut',style:`background:conic-gradient(${parts.join(',')})`,role:'img','aria-label':'Кольцевая диаграмма расходов по категориям'});ring.append(el('div',{class:'donut-center'},el('strong',{class:'money'},money(sum)),el('span',{},'положительные траты')));
+    const legend=el('div',{class:'chart-legend'},positive.map(row=>el('div',{class:'legend-row'},el('span',{class:'legend-dot',style:`background:${row.color}`}),el('span',{class:'grow'},row.name),el('strong',{class:'money'},money(row.amount)),el('span',{class:'hint'},percentBig(row.amount,sum)+'%'))));
+    card.append(el('div',{class:'donut-layout'},ring,legend));
+    if(report.refundsOver)card.append(el('p',{class:'notice'},'Возвраты сверх трат периода: '+money(report.refundsOver)+'. Они не образуют отрицательный сектор и объясняются отдельно.'));
+    card.append(reportTable(['Категория','Чистая сумма','Доля положительных трат'],report.categories.map(row=>[row.name,money(row.amount),row.amount>0n?percentBig(row.amount,sum)+'%':'Возврат сверх трат']), 'Расходы по категориям'));
+    return card;
+  }
+  function cashflowChart(report) {
+    const card=el('section',{class:'card chart-card'},el('div',{class:'section-head'},el('div',{},el('h2',{},'Доходы и расходы во времени'),el('p',{class:'hint'},'Фактические рублевые оценки. Время в дневном виде условно, если его не указывали.'))));
+    const max=report.bins.reduce((m,row)=>{const local=absBig(row.income)>absBig(row.expense)?absBig(row.income):absBig(row.expense);return local>m?local:m;},0n);
+    if(!max){card.append(empty('Движений за период нет','Смените период или добавьте фактическую операцию.'));return card;}
+    const rows=el('div',{class:'cashflow-chart',role:'img','aria-label':'Столбцы доходов и расходов по периодам'});
+    for(const row of report.bins){const item=el('div',{class:'cashflow-row'},el('span',{class:'cashflow-label'},row.label),el('div',{class:'cashflow-bars'},el('i',{class:'cashflow-bar income '+(row.income<0n?'below':'above'),style:`--bar:${percentBig(row.income,max)}%`,'aria-hidden':'true'}),el('i',{class:'cashflow-bar expense '+(row.expense<0n?'below':'above'),style:`--bar:${percentBig(row.expense,max)}%`,'aria-hidden':'true'})),el('span',{class:'cashflow-value money'},`${row.income>=0n?'+':'−'}${money(absBig(row.income))} · ${row.expense>=0n?'−':'+'}${money(absBig(row.expense))}`));rows.append(item);}
+    card.append(el('div',{class:'chart-key'},el('span',{},el('i',{class:'key-square income'}),'Доходы'),el('span',{},el('i',{class:'key-square expense'}),'Расходы')),rows,reportTable(['Дата','Доходы','Расходы'],report.bins.map(row=>[row.label,money(row.income),money(row.expense)]),'Доходы и расходы по времени'));
+    return card;
+  }
+  function svgNode(tag,attrs={},children=[]) {const node=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [key,value] of Object.entries(attrs))node.setAttribute(key,String(value));for(const child of children)node.append(child);return node;}
+  function goalChart(range) {
+    const goals=data.goals.filter(g=>g.status!=='archived');const card=el('section',{class:'card chart-card goal-chart-card'},el('div',{class:'section-head'},el('div',{},el('h2',{},'Прогресс цели'),el('p',{class:'hint'},'Накоплено и план по датам. Суммы — в валюте выбранной цели.'))));
+    if(!goals.length){card.append(empty('Целей пока нет','Создайте цель, чтобы увидеть ее путь к сумме.'));return card;}
+    if(!goals.some(g=>g.id===reportGoal))reportGoal=goals[0].id;
+    const chooser=el('select',{'aria-label':'Цель для графика','data-testid':'goal-report-select'},goals.map(g=>el('option',{value:g.id},g.name)));chooser.value=reportGoal;chooser.addEventListener('change',event=>{reportGoal=event.target.value;render();});card.querySelector('.section-head').append(chooser);
+    const g=get(data,'goals',reportGoal),points=goalReportSeries(g,range),target=BigInt(g.target),width=640,height=214,left=35,right=12,top=14,bottom=33,plotW=width-left-right,plotH=height-top-bottom;
+    const xy=(value,index)=>`${left+(points.length===1?plotW/2:index*plotW/(points.length-1))},${top+plotH-(target?Math.min(100,Number(rounded(value*10000n,target))/100)*plotH/100:0)}`;
+    const svg=svgNode('svg',{viewBox:`0 0 ${width} ${height}`,class:'goal-svg',role:'img','aria-label':`График цели ${g.name}`});
+    svg.append(svgNode('line',{x1:left,y1:top+plotH,x2:width-right,y2:top+plotH,class:'goal-axis'}),svgNode('polyline',{points:points.map((p,i)=>xy(p.planned,i)).join(' '),class:'goal-plan-line'}),svgNode('polyline',{points:points.map((p,i)=>xy(p.saved,i)).join(' '),class:'goal-saved-line'}));
+    for(const [index,point] of points.entries()){if(index===0||index===points.length-1||index%Math.ceil(points.length/5)===0)svg.append(svgNode('text',{x:left+(points.length===1?plotW/2:index*plotW/(points.length-1)),y:height-9,'text-anchor':'middle',class:'goal-axis-text'},[document.createTextNode(point.label)]));}
+    card.append(el('div',{class:'goal-chart-key'},el('span',{},el('i',{class:'goal-key saved'}),'Накоплено'),el('span',{},el('i',{class:'goal-key planned'}),'План')),svg,el('p',{class:'hint'},`Цель: ${money(target,g.currency)}${g.mode==='date'&&g.dueDate?' · желаемая дата '+formatDate(g.dueDate):' · комфортный темп'}. Курс при пересчете резервов используется на дату точки.`),reportTable(['Дата','Накоплено','План'],points.map(point=>[formatDate(point.date),money(point.saved,g.currency),money(point.planned,g.currency)]),`Прогресс цели ${g.name}`));
+    return card;
+  }
+  function reconciliationCard(report) {
+    const card=el('section',{class:'card reconciliation-card'},el('div',{class:'section-head'},el('div',{},el('h2',{},'Сверка движения активов'),el('p',{class:'hint'},'Изменение активов не равно только разнице доходов и расходов: займы и курс показаны отдельно.'))));
+    const rows=[['Активы на начало периода',report.opening],['Доходы',report.income],['Расходы',-report.expense],['Прочие внешние движения',report.other],['Переоценка курсов и округления',report.revaluation],['Активы на конец периода',report.closing]];
+    card.append(el('div',{class:'reconciliation-lines'},rows.map(([label,value],index)=>el('div',{class:'row between '+(index===rows.length-1?'total-line':'')},el('span',{},label),el('strong',{class:'money'},money(value))))));
+    if(report.missing)card.append(el('p',{class:'notice warning'},'Сверка неполная: у части остатков или операций нет ручного курса на нужную дату.'));
+    return card;
+  }
+  function renderAnalytics(main,range,report) {
+    main.append(reportControls(range));
+    if(report.missing)main.append(el('p',{class:'hint warning-text'},'Часть исторических рублевых оценок отсутствует; графики и сверка показывают известную часть.'));
+    main.append(el('div',{class:'analytics-grid'},categoryChart(report),cashflowChart(report),goalChart(range)),reconciliationCard(report));
+  }
   function renderOverview(main){
-    main.append(header('Все деньги — перед вами','Текущие остатки и последние движения семейного бюджета.',canSubmit()?[button('+ Добавить операцию',()=>operationDialog('expense'),'primary')]:[]));
-    const all=total(data),b=budgetInfo(data),sums=balances(data),month=today(data).slice(0,7)+'-01',stats=statistics(data,month);
+    main.append(header('Все деньги — перед вами','Текущие остатки и последние движения семейного бюджета.',canSubmit()?[button('+ Добавить операцию',()=>operationDialog('expense'),'primary'),button('Наговорить',voiceDialog,'quiet')]:[]));
+    reportAnchor||=today(data);const range=reportRange(reportPeriod,reportAnchor),report=reportData(data,range);
+    const all=total(data),b=budgetInfo(data),sums=balances(data);
     if(all.missing.length)main.append(el('div',{class:'notice warning'},'Итог неполный: нет курса для '+all.missing.map(x=>money(x.amount,x.currency)).join(', ')+'. Укажите ручной курс в настройках.'));
     const breakdown=el('details',{},el('summary',{},'Из чего складывается баланс'),el('div',{class:'breakdown'},data.wallets.filter(w=>!w.archived).map(w=>el('div',{class:'row between'},el('span',{},w.name),el('span',{class:'money'},money(sums[w.id],w.currency))))));
     for(const d of data.deposits.filter(d=>depositBalance(data,d)))breakdown.querySelector('.breakdown').append(el('div',{class:'row between'},el('span',{},d.name+' · вклад'),el('span',{class:'money'},money(depositBalance(data,d),d.currency))));
@@ -772,8 +907,8 @@
       el('div',{class:'form-section'},'Резервы'),Object.entries(reserveBalances(data)).filter(([,a])=>a>0n).map(([key,a])=>{const [gid,wid]=key.split('|'),w=get(data,'wallets',wid);return el('div',{class:'row between'},el('span',{},get(data,'goals',gid)?.name+' · '+w.name+(w.liquid?'':' · вне L')),el('span',{class:'money'},money(a,w.currency)));}),el('div',{class:'form-section'},'Ожидаемые платежи'),data.plans.filter(p=>p.kind==='expense'&&p.date<=monthEnd(today(data))&&planState(data,p).remaining).map(p=>el('div',{class:'row between'},el('span',{},p.comment||categoryName(p.categoryId)),el('span',{class:'money'},money(planState(data,p).remaining,p.currency)),button('Открыть',()=>planDetails(p),'link'))),el('div',{class:'form-section'},'План целей на месяц'),data.goals.filter(g=>g.status==='active').map(g=>el('div',{class:'row between'},el('span',{},g.name),el('span',{class:'money'},money(goalInfo(data,g).left,g.currency))))));
     const parts=detail.querySelector('.breakdown');parts.append(el('div',{class:'breakdown'},el('div',{class:'form-section'},'Доступные кошельки · L'),data.wallets.filter(w=>w.liquid&&!w.archived).map(w=>el('div',{class:'row between'},el('span',{},w.name),el('span',{class:'money'},money(sums[w.id],w.currency)))),el('div',{class:'form-section'},'Ожидаемые доходы · сценарий E'),data.plans.filter(p=>p.kind==='income'&&p.date<=monthEnd(today(data))&&get(data,'wallets',p.walletId)?.liquid&&planState(data,p).remaining).map(p=>el('div',{class:'row between'},el('span',{},(p.comment||categoryName(p.categoryId))+(p.date<today(data)?' · срок получения прошел':'')),el('span',{class:'money'},money(planState(data,p).remaining,p.currency))))));
     main.append(el('div',{class:'cards-two'},el('section',{class:'card balance-card main-balance'},el('div',{class:'balance-label'},'Общий баланс'),el('div',{class:'balance-value','data-testid':'total-balance'},totalText(all)),el('p',{class:'hint'},'Сейчас, активы без вычета долгов'),breakdown),el('section',{class:'card balance-card'},el('div',{class:'balance-label'},'Можно потратить'),el('div',{class:'balance-value','data-testid':'available-balance'},b.missing?el('span',{class:'balance-note'},'Неполный расчет · нет всех курсов'):null,b.A<0n?'Не хватает '+money(-b.A):money(b.A)),el('p',{class:'hint'},'До конца текущего месяца, без будущих поступлений'),button('Как рассчитана сумма',()=>{detail.open=true;openForm('Можно потратить','Доступные деньги за вычетом резервов и оставшихся ожиданий.',body=>body.append(detail),null,null);},'link available-trigger'))));
-    main.append(el('div',{class:'metric-grid'},metric('Доходы за месяц',money(stats.income),'positive'),metric('Расходы за месяц',money(stats.expense),'negative'),metric('Разница доходов и расходов',money(stats.income-stats.expense),'')));
-    if(stats.missing)main.append(el('p',{class:'hint'},'Суммы за месяц неполные: у части записей нет исторического курса.'));
+    main.append(el('div',{class:'metric-grid'},metric('Доходы · '+range.label,money(report.income),'positive'),metric('Расходы · '+range.label,money(report.expense),'negative'),metric('Разница доходов и расходов',money(report.income-report.expense),'')));
+    renderAnalytics(main,range,report);
     renderPlanningSummary(main);
     const recent=latestOperations().filter(o=>o.status==='posted').slice(0,5),list=el('section',{class:'card table-card'},el('div',{class:'section-head table-top'},el('h2',{},'Последние операции'),button('Все операции →',()=>navigate('operations'),'link')),recent.length?operationTable(recent,true):empty('История начинается здесь','Добавьте первое поступление или расход — они появятся в этом списке.',canSubmit()?button('Добавить запись',()=>operationDialog('expense'),'small'):null));
     const walletList=el('section',{class:'card'},el('div',{class:'section-head'},el('h2',{},'Кошельки'),button('Открыть →',()=>navigate('wallets'),'link')));
@@ -988,8 +1123,46 @@
   function debtPaymentDialog(d,event=null){const s=editingState('debt',event),st=debtState(s,get(s,'personalDebts',d.id)),dec=get(s,'currencies',d.currency).decimals;
     openForm(d.direction==='owe'?'Вернуть личный долг':'Получить возврат займа',d.counterparty+' · частичный возврат разрешен.',body=>{body.append(field('Дата *','date',event?.date||today(data),{type:'date'}),field('Кошелек *','walletId',get(data,'operations',event?.operationId)?.walletId||d.walletId,{choices:contractWallets(d.currency)}),field('Основной долг *','principal',plain(event?.principal||st.principal,dec),{inputmode:'decimal'}),field('Проценты отдельно','interest',plain(event?.interest||0,dec),{inputmode:'decimal'}));if(d.direction==='owe')contractFields(body,d.walletId);if(event)body.append(field('Причина исправления *','reason','',{maxlength:300}));},async(form,opts)=>{await command('debt.pay',{...contractFormValues(form),id:d.id,editEventId:event?.id},opts);return 'Возврат сохранен';},'Подтвердить возврат');
   }
+  function voiceAmountText(match) {
+    const source=match[1].replace(',','.');const multiplier=/^(тыс|тысяч)/.test(match[2]||'')?1000n:/^(млн|миллион)/.test(match[2]||'')?1000000n:1n;
+    if(multiplier===1n)return source;const [whole,fraction='']=source.split('.'),scale=10n**BigInt(fraction.length),raw=(BigInt(whole+fraction)*multiplier),integer=raw/scale,remainder=raw%scale;
+    return remainder?integer+'.'+remainder.toString().padStart(fraction.length,'0').replace(/0+$/,''):integer.toString();
+  }
+  function parseVoice(text,s=data) {
+    const original=String(text||'').trim(),source=original.toLocaleLowerCase('ru').replace(/ё/g,'е').replace(/(\d)[\s\u00a0](?=\d{3}(?:\D|$))/g,'$1');
+    const warnings=[],hits=[...source.matchAll(/(?<![\d.,])(\d+(?:[.,]\d+)?)(?:\s*(тыс\.?|тысяч[а-я]*|млн\.?|миллион[а-я]*))?/gu)];
+    let amount='';if(hits.length===1)amount=voiceAmountText(hits[0]);else warnings.push(hits.length?'Несколько сумм: оставьте одну операцию или заполните сумму вручную.':'Не найдена сумма цифрами: введите ее вручную.');
+    let currency='RUB';if(/доллар|\busd\b/.test(source))currency='USD';else if(/евро|\beur\b/.test(source))currency='EUR';else if(/\busdt\b|тетер/.test(source))currency='USDT';else if(/биткоин|\bbtc\b/.test(source))currency='BTC';else if(/эфир|\beth\b/.test(source))currency='ETH';
+    const isIncome=/(зарплат|аванс|отпускн|получил[а-я]*|заработ|выигрыш|лотере|подработк|продал[а-я]*)/u.test(source),isExpense=/(потрат|потрачен|купил[а-я]*|покупк|расход|магазин)/u.test(source);
+    const categoryCode=(()=>{if(/продукт|магазин/u.test(source))return 'groceries';if(/транспорт|такси|бензин/u.test(source))return 'transport';if(/одежд|обув/u.test(source))return 'clothes';if(/жиль|коммун|аренд/u.test(source))return 'home';if(/здоров|аптек|врач/u.test(source))return 'health';if(/развлеч|кино|кафе/u.test(source))return 'fun';if(/подписк/u.test(source))return 'subscriptions';if(/непредвид|ремонт/u.test(source))return 'unexpected';if(/комисси/u.test(source))return 'bank_fees';if(/зарплат/u.test(source))return 'salary';if(/аванс/u.test(source))return 'advance';if(/отпускн/u.test(source))return 'vacation';if(/подар/u.test(source))return 'gift';if(/подработ/u.test(source))return 'side';if(/продал/u.test(source))return 'sale';if(/выигрыш|лотере/u.test(source))return 'win';return '';})();
+    let kind=isIncome&&!isExpense?'income':isExpense&&!isIncome?'expense':'';
+    if(!kind&&categoryCode&&get(s,'categories',categoryCode)?.type==='expense')kind='expense';
+    if(!kind)warnings.push('Тип операции неясен: выберите доход или расход перед сохранением.');
+    let date=today(s);if(/позавчера/u.test(source))date=addDays(date,-2);else if(/вчера/u.test(source))date=addDays(date,-1);
+    const member=(family(s).members||[]).find(m=>source.includes(m.name.toLocaleLowerCase('ru').replace(/ё/g,'е')))||(/ребен|сын|доч/u.test(source)?(family(s).members||[]).find(m=>/ребен|сын|доч/u.test(m.name.toLocaleLowerCase('ru'))):/муж/u.test(source)?(family(s).members||[]).find(m=>/муж/u.test(m.name.toLocaleLowerCase('ru'))):/себе/u.test(source)?(family(s).members||[]).find(m=>/мне|я/u.test(m.name.toLocaleLowerCase('ru'))):null);
+    const matches=s.wallets.filter(w=>!w.archived&&w.currency===currency),primary=matches.find(w=>w.primaryForCurrency);let walletId=primary?.id||'',requireWallet=false;
+    if(!walletId&&matches.length===1)walletId=matches[0].id;else if(!walletId){requireWallet=true;warnings.push(matches.length?`Выберите основной кошелек в ${currency}.`:`Нет активного кошелька в ${currency}: сначала добавьте его или выберите счет вручную.`);}
+    let categoryId=categoryCode;if(!categoryId||get(s,'categories',categoryId)?.type!==kind){categoryId=kind==='income'?'other_income':'other_expense';if(kind)warnings.push('Категория не определена: выбрано «Прочее», проверьте ее.');}
+    let comment='';const repair=source.match(/расход[а-я]*\s+(.+?)\s+\d/u);if(categoryId==='unexpected'&&repair)comment=repair[1].trim();
+    return {kind,amount,currency,walletId,requireWallet,date,categoryId,memberId:member?.id||'',comment,warnings,voiceText:original,voiceWarning:warnings.join(' ')};
+  }
+  function stopVoiceRecognition() {clearTimeout(voiceTimer);voiceTimer=null;const current=voiceRecognition;voiceRecognition=null;if(current){current.onend=null;try{current.stop();}catch{/* Recognition may already be closed. */}}}
+  function voiceReview(text) {const parsed=parseVoice(text);operationDialog(parsed.kind||'expense',null,parsed);}
+  function voiceDialog() {
+    const Speech=window.SpeechRecognition||window.webkitSpeechRecognition;
+    openForm('Голосовая запись','Голос распознает браузер: сервис может использовать интернет. Аудио не сохраняется.',body=>{
+      const status=el('p',{class:'notice',role:'status','aria-live':'polite'},Speech?'Нажмите «Начать запись», затем произнесите одну сумму дохода или расхода.':'В этом браузере нет распознавания речи. Используйте обычную форму операции.'),transcript=field('Распознанный текст','voiceTranscript','',{type:'textarea',readonly:true,hint:'Текст можно продолжить или исправить перед заполнением формы.'}),actions=el('div',{class:'row wrap'}),start=button('Начать запись',begin,'primary'),stop=button('Остановить',()=>{stopVoiceRecognition();status.textContent='Запись остановлена. Проверьте текст или начните снова.';},'quiet'),continueButton=button('Продолжить с текстом',()=>{const value=transcript.querySelector('textarea').value.trim();if(!value){status.textContent='Сначала произнесите или введите текст.';return;}closeDialog(true);voiceReview(value);},'small');
+      actions.append(start,stop,continueButton);body.append(status,transcript,actions);if(!Speech){start.disabled=true;stop.disabled=true;return;}
+      function begin(){stopVoiceRecognition();const recognition=new Speech();voiceRecognition=recognition;recognition.lang='ru-RU';recognition.continuous=false;recognition.interimResults=true;recognition.maxAlternatives=1;let finalText='',completed=false;start.disabled=true;status.textContent='Слушаю… говорите одну операцию.';
+        recognition.onresult=event=>{let text='';let final=false;for(let i=event.resultIndex||0;i<event.results.length;i++){text+=event.results[i][0].transcript+(i<event.results.length-1?' ':'');final||=event.results[i].isFinal;}transcript.querySelector('textarea').value=text.trim();if(final&&text.trim()&&!completed){completed=true;finalText=text.trim();stopVoiceRecognition();closeDialog(true);voiceReview(finalText);}};
+        recognition.onerror=event=>{const messages={not_allowed:'Нет доступа к микрофону. Разрешите его и повторите.',service_not_allowed:'Сервис распознавания недоступен.',network:'Нет сети для распознавания. Текст не потерян — можно заполнить форму вручную.',no_speech:'Речь не распознана. Повторите или заполните текст вручную.',aborted:'Запись остановлена.'};status.textContent=messages[event.error]||'Не удалось распознать речь. Повторите или заполните форму вручную.';start.disabled=false;stopVoiceRecognition();};
+        recognition.onend=()=>{if(voiceRecognition===recognition){voiceRecognition=null;clearTimeout(voiceTimer);if(!completed){start.disabled=false;if(!transcript.querySelector('textarea').value)status.textContent='Запись завершена без текста. Повторите или используйте ручной ввод.';}}};
+        try{recognition.start();voiceTimer=setTimeout(()=>{if(voiceRecognition===recognition){status.textContent='Запись остановлена через 30 секунд. Проверьте текст.';stopVoiceRecognition();start.disabled=false;}},30000);}catch{status.textContent='Не удалось запустить микрофон. Попробуйте еще раз или используйте ручной ввод.';start.disabled=false;}
+      }
+    },null,null);
+  }
   function renderOperations(main){
-    main.append(header('Операции','Доходы, расходы и переводы — с понятной историей.',canSubmit()?[button('+ Добавить операцию',()=>operationDialog('expense'),'primary')]:[]));
+    main.append(header('Операции','Доходы, расходы и переводы — с понятной историей.',canSubmit()?[button('+ Добавить операцию',()=>operationDialog('expense'),'primary'),button('Наговорить',voiceDialog,'quiet')]:[]));
     const pending=data.proposals.filter(q=>q.status==='pending'&&(owner()||q.authorId===session.id)).length;
     main.append(el('div',{class:'tabs'},button('Все операции',()=>{operationTab='posted';render();},operationTab==='posted'?'active':''),user().role!=='viewer'?button(`Заявки${pending?' · '+pending:''}`,()=>{operationTab='proposals';render();},operationTab==='proposals'?'active':''):null));
     if(operationTab==='proposals'&&user().role!=='viewer'){renderProposals(main);return;}
@@ -1037,16 +1210,17 @@
     const q=extra.proposal,seed=q?.payload||(existing?payloadFromOperation(existing):{});kind=seed.kind||kind;
     const editableKinds=writer()?Object.entries(TYPE).filter(([k])=>MANUAL_TYPES.includes(k)):Object.entries(TYPE).filter(([k])=>['income','expense','refund'].includes(k));
     const primary=data.wallets.find(w=>!w.archived&&w.primaryForCurrency&&w.currency==='RUB')||data.wallets.find(w=>!w.archived);
-    const initial={date:today(data),time:timeIn(data),walletId:extra.walletId||primary.id,amount:'',comment:'',...seed,...extra};
+    const initial={date:today(data),time:timeIn(data),walletId:Object.hasOwn(extra,'walletId')?extra.walletId:primary.id,amount:'',comment:'',...seed,...extra};
     const review=!!extra.approve,request=!!extra.request;
     const title=review?'Проверить заявку':request?'Запрос на исправление':existing?'Изменить операцию':'Добавить операцию';
     const label=review?'Одобрить и провести':request?'Отправить запрос':q?'Сохранить заявку':user().role==='contributor'?'Отправить на подтверждение':'Сохранить операцию';
     openForm(title,review?`Автор: ${personName(q.authorId)}. Проверьте данные перед проведением.`:'Деньги изменятся только после подтверждения записи.',(body,form)=>{
+      if(initial.voiceText)body.append(el('div',{class:'review-box voice-review'},el('strong',{},'Распознано'),el('p',{},initial.voiceText),initial.voiceWarning?el('p',{class:'hint warning-text'},initial.voiceWarning):null,el('p',{class:'hint'},'Проверьте все поля перед сохранением. Аудио не хранится.')));
       const selector=field('Тип операции *','kind',kind,{choices:editableKinds,disabled:!!existing||!!q||request});body.append(selector);
       const dynamic=el('div',{});body.append(dynamic);
       const buildFields=current=>{
         dynamic.replaceChildren();const tx=current==='transfer'||current==='fx';
-        dynamic.append(el('div',{class:'form-grid'},field(tx?'Счет списания *':'Кошелек *','walletId',initial.walletId,{choices:optionsWallets()}),field('Сумма *','amount',initial.amount,{inputmode:'decimal',placeholder:'0,00'})),el('div',{class:'form-grid'},field('Дата *','date',initial.date,{type:'date',min:family(data).startDate,max:today(data)}),field('Время *','time',initial.time,{type:'time'})));
+        dynamic.append(el('div',{class:'form-grid'},field(tx?'Счет списания *':'Кошелек *','walletId',initial.walletId,{choices:(initial.requireWallet?[['','Выберите кошелек'],...optionsWallets()]:optionsWallets())}),field('Сумма *','amount',initial.amount,{inputmode:'decimal',placeholder:'0,00'})),el('div',{class:'form-grid'},field('Дата *','date',initial.date,{type:'date',min:family(data).startDate,max:today(data)}),field('Время *','time',initial.time,{type:'time'})));
         if(current==='income'||current==='expense')dynamic.append(field('Категория *','categoryId',initial.categoryId|| (current==='income'?'salary':'groceries'),{choices:optionsCategories(current,initial.categoryId)}),field('Кому относится','memberId',initial.memberId||'',{choices:members()}));
         if(current==='expense'){
           const split=check('Разделить покупку по категориям','split',!!initial.lines&&initial.lines.length>1);dynamic.append(split);const rows=el('div',{});dynamic.append(rows);const add=button('+ Еще категория',()=>addLine(),'small quiet');dynamic.append(add);
@@ -1093,6 +1267,7 @@
       if(review)body.prepend(el('div',{class:'review-box'},`Заявлено: ${TYPE[q.payload.kind]} · ${q.payload.amount} · ${get(data,'wallets',q.payload.walletId)?.name||'счет'}. ${q.payload.comment||''}`));
     },async(form,opts)=>{
       const p={...values(form),kind:existing||q?kind:formValue(form,'kind'),allowOverdraft:formCheck(form,'allowOverdraft'),saveFxRate:formCheck(form,'saveFxRate')};
+      if(initial.voiceCurrency){const selected=get(data,'wallets',p.walletId);if(selected?.currency!==initial.voiceCurrency)throw new AppError(`Выберите кошелек в валюте ${initial.voiceCurrency}.`,'walletId');}
       p.planFinalize=formValue(form,'planFinish')==='final';p.reserveActions=[...form.querySelectorAll('.reserve-action')].map(row=>({goalId:row.querySelector('[name=actionGoalId]').value,walletId:row.querySelector('[name=actionWalletId]').value,amount:row.querySelector('[name=actionAmount]').value,release:!!row.querySelector('[name=actionRelease]')?.checked})).filter(a=>a.goalId||a.amount);
       for(const key of ['actionGoalId','actionWalletId','actionAmount','actionRelease','planFinish'])delete p[key];
       if(['income','expense'].includes(p.kind)&&!p.planId){const wallet=get(data,'wallets',p.walletId),similar=data.plans.some(plan=>plan.kind===p.kind&&plan.currency===wallet?.currency&&plan.categoryId===p.categoryId&&planState(data,plan).remaining&&Math.abs(dayNumber(plan.date)-dayNumber(p.date))<32);if(similar&&!confirm('Похожий план остается несвязанным. Сохранить как отдельную операцию, оставив его в ожиданиях?'))throw new AppError('Выберите план в этой форме.','planId');}
@@ -1162,7 +1337,15 @@
         for(const m of family(data).members)tags.append(el('div',{class:'list-row'},el('span',{class:'grow'},m.name),button('Переименовать',()=>memberDialog(m),'small quiet')));grid.append(tags);
       }
       grid.append(el('section',{class:'card'},el('h2',{},'Мой профиль'),el('h3',{},user().displayName),el('p',{class:'hint'},`${user().loginNormalized} · ${ROLE[user().role]}`),button('Сменить пароль',()=>passwordDialog(),'small')));
-      grid.append(el('section',{class:'card'},el('h2',{},'Хранение данных'),el('p',{class:'hint'},'Бюджет хранится в этом браузере. Другой браузер или устройство не получает его автоматически. Очистка данных сайта удалит локальный бюджет.'),el('p',{class:'hint'},'Локальные роли помогают избежать случайных изменений; серверной защиты и синхронизации в этой версии нет.'),el('p',{class:'hint',id:'storage-size'},'Объем данных: подсчитываем…')));main.append(grid);
+      grid.append(el('section',{class:'card'},el('h2',{},'Хранение данных'),el('p',{class:'hint'},'Бюджет хранится в этом браузере. Другой браузер или устройство не получает его автоматически. Очистка данных сайта удалит локальный бюджет.'),el('p',{class:'hint'},'Локальные роли помогают избежать случайных изменений; серверной защиты и синхронизации в этой версии нет.'),el('p',{class:'hint',id:'storage-size'},'Объем данных: подсчитываем…')));
+      const selected=new Set(family(data).investmentInterests||[]),interestCard=el('section',{class:'card wide investment-card'},el('details',{},el('summary',{},'Интересующие инвестиции'),el('p',{class:'hint'},'Необязательный выбор на будущее. В этой версии нет покупки бумаг, котировок, доходности или инвестиционного портфеля.')));
+      const details=interestCard.querySelector('details');
+      if(owner()){
+        const form=el('form',{onSubmit:async event=>{event.preventDefault();try{const interests=[...form.querySelectorAll('[name=interests]:checked')].map(node=>node.value);await command('family.investments',{interests});toast('Интересы сохранены');}catch(error){toast(error.message,true);}}});
+        const interestCheck=(label,value)=>el('label',{class:'check'},el('input',{type:'checkbox',name:'interests',value,checked:selected.has(value)}),el('span',{},label));
+        form.append(interestCheck('Акции','stocks'),interestCheck('Облигации','bonds'),interestCheck('Фонды','funds'),el('button',{type:'submit',class:'small'},'Сохранить выбор'));details.append(form);
+      }else details.append(el('p',{class:'hint'},selected.size?'Выбрано: '+[...selected].map(key=>({stocks:'Акции',bonds:'Облигации',funds:'Фонды'}[key])).join(', '):'Владелец пока не выбрал интересующие инструменты.'));
+      grid.append(interestCard);main.append(grid);
       const count=new Blob([JSON.stringify(data)]).size;document.getElementById('storage-size').textContent=`Объем записей: ${(count/1024).toFixed(1)} КБ. Экспорт и импорт в первой версии не предусмотрены.`;
     }
     if(settingsTab==='rates')renderRates(main);if(settingsTab==='categories')renderCategories(main);if(settingsTab==='users')renderUsers(main);if(settingsTab==='audit')renderAudit(main);
@@ -1217,7 +1400,7 @@
     setInterval(()=>{if(!document.hidden)reconcile();},60000);
     document.addEventListener('visibilitychange',()=>{if(!document.hidden){if(session&&Date.now()-lastActivity>=15*60*1000)lock();refresh().then(()=>reconcile()).catch(e=>toast(e.message,true));}});
     // Command interface retains the same role/revision checks as every UI action.
-    window.MoneyByPlan=Object.freeze({command,parseMoney,plain,money,rounded,validDate,dateIn,rateAt,inRub,balances,statistics,monthlyDate,nextMonth,convert,reserveBalances,planState,coverageLeft,goalInfo,budgetInfo,limitInfo,depositBalance,depositProjection,depositEarly,loanSchedule,loanState,loanPreview,debtState});
+    window.MoneyByPlan=Object.freeze({command,parseMoney,plain,money,rounded,validDate,dateIn,rateAt,inRub,balances,statistics,monthlyDate,nextMonth,convert,reserveBalances,planState,coverageLeft,goalInfo,budgetInfo,limitInfo,depositBalance,depositProjection,depositEarly,loanSchedule,loanState,loanPreview,debtState,reportRange,reportData,assetValueAt,parseVoice});
   }
   init();
 })();
